@@ -1,9 +1,15 @@
 [project]
 name = "yc-rl-hackathon"
 version = "0.1.0"
-description = "Add your description here"
+description = "Rubber-tree farm RL environment for HUD (env.py + Farm/ simulation)."
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "hud-python>=0.6.6",
 ]
+
+# This repo is an environment, not an installable library: env.py / tasks.py /
+# Farm/ are imported from the working directory at serve time. Tell uv to only
+# install dependencies and not try to build the project itself as a package.
+[tool.uv]
+package = false

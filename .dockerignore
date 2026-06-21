@@ -1,0 +1,13 @@
+# Keep the build context (and image) small. uv.lock is intentionally NOT ignored.
+.venv/
+**/__pycache__/
+*.py[oc]
+.git/
+.gitignore
+.cursor/
+_scaffold_ref/
+*.plan.md
+build/
+dist/
+wheels/
+*.egg-info/
