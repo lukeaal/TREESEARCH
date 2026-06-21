@@ -76,52 +76,48 @@ def best_baseline_profit(spec: FarmSpec) -> float:
     return max(reference_profit(spec, tap_only), reference_profit(spec, tend_and_tap))
 
 
-# Reward earned at the worst-case anchor. Kept above 0 on purpose: a forgiving
-# floor means even poor play gets a little signal (and a gradient just below the
-# floor), instead of a flat-zero desert that gives RL nothing to climb.
-SOFT_FLOOR_REWARD = 0.1
+# Smallest positive reward for a plan that harvested *some* rubber but lost money
+# heavily. Any harvest at all clears 0 (you did something productive); the score
+# then climbs as losses shrink and, past break-even, as profit grows.
+MIN_HARVEST_REWARD = 0.1
 
 
-def reward_anchors(spec: FarmSpec) -> tuple[float, float, float]:
-    """``(floor, human, ceil)`` profit anchors for the env reward.
+def reward_anchors(spec: FarmSpec) -> tuple[float, float]:
+    """``(loss_floor, ceil)`` profit anchors for the env reward.
 
-    - ``floor`` = the worst-case operator (max spend, no harvest) -> reward 0.1.
-    - ``human`` = a sensible human-like operator (``tend_and_tap``) -> reward 0.5.
-    - ``ceil``  = the best simple baseline (tap everything) -> reward 1.0.
+    - ``loss_floor`` = the worst-case operator's (negative) profit: the bottom of
+      the "harvested but losing money" band.
+    - ``ceil`` = the best simple baseline (tap everything): the profit that earns
+      a full 1.0.
 
-    See :func:`scale_reward` for how a profit maps through these. The middle
-    anchor lets us pin "what a human would do" at 0.5, with room to score lower
-    (poor play, but still positive) or higher (beating the human baseline).
+    Break-even (profit 0) always maps to 0.5. See :func:`scale_reward`.
     """
-    floor = reference_profit(spec, worst_case)
-    human = reference_profit(spec, tend_and_tap)
-    ceil = max(best_baseline_profit(spec), human)
-    return floor, human, ceil
+    loss_floor = reference_profit(spec, worst_case)
+    ceil = max(best_baseline_profit(spec), reference_profit(spec, tend_and_tap))
+    return loss_floor, ceil
 
 
-def scale_reward(profit: float, anchors: tuple[float, float, float]) -> float:
-    """Map ``profit`` to ``0..1`` through ``(floor, human, ceil)`` piecewise.
+def scale_reward(
+    profit: float, latex_lb: float, anchors: tuple[float, float]
+) -> float:
+    """Map ``(profit, rubber harvested)`` to ``0..1``.
 
-    - ``human..ceil`` -> ``0.5..1.0`` (beating the human baseline climbs to 1.0).
-    - ``floor..human`` -> ``SOFT_FLOOR_REWARD..0.5`` (poor-but-trying play still
-      earns a meaningful positive reward; do-nothing lands comfortably above 0).
-    - below ``floor`` -> a gentle tail from ``SOFT_FLOOR_REWARD`` down to 0 over
-      another floor-span, so catastrophic spending is penalised *smoothly*
-      instead of slamming to a hard, gradient-free zero.
+    - harvested NO rubber (``latex_lb <= 0``) -> ``0.0``. Doing nothing earns
+      nothing; you must actually tap and sell rubber to score.
+    - harvested rubber but UNPROFITABLE (``profit <= 0``) -> a positive band,
+      ``MIN_HARVEST_REWARD..0.5``, rising as losses shrink toward break-even.
+    - harvested rubber and PROFITABLE (``profit > 0``) -> ``0.5..1.0``, rising
+      with profit and reaching ``1.0`` at the best-baseline profit (``ceil``).
 
-    Clamped to ``[0, 1]``.
+    So a full ``1.0`` requires being profitable; harvesting-while-losing still
+    gets meaningful positive credit, and being profitable scores strictly higher.
     """
-    floor, human, ceil = anchors
-    if profit >= human:
-        denom = ceil - human
-        reward = 0.5 + 0.5 * (profit - human) / denom if denom > 0 else 1.0
-    elif profit >= floor:
-        denom = human - floor
-        frac = (profit - floor) / denom if denom > 0 else 0.0
-        reward = SOFT_FLOOR_REWARD + (0.5 - SOFT_FLOOR_REWARD) * frac
-    else:
-        # Below the worst-case anchor: decay to 0 over a span the size of |floor|.
-        span = abs(floor) if floor else 1.0
-        frac = max(0.0, 1.0 + (profit - floor) / span)
-        reward = SOFT_FLOOR_REWARD * frac
-    return max(0.0, min(1.0, reward))
+    loss_floor, ceil = anchors
+    if latex_lb <= 0:
+        return 0.0
+    if profit <= 0:
+        span = -loss_floor if loss_floor < 0 else 1.0
+        frac = max(0.0, min(1.0, (profit - loss_floor) / span)) if span > 0 else 1.0
+        return MIN_HARVEST_REWARD + (0.5 - MIN_HARVEST_REWARD) * frac
+    frac = min(1.0, profit / ceil) if ceil > 0 else 1.0
+    return 0.5 + 0.5 * frac

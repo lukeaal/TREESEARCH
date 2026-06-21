@@ -1,19 +1,21 @@
-"""HUD v6 environment: run a rubber-tree farm for 30 years, maximise profit.
+"""HUD environment: optimise a 30-year rubber-farm plan, maximise profit.
 
-The agent acts on a living :class:`Farm.Farm` simulation through MCP tools
-(observe / render / water / fertilize / tap / advance / status). The reward is
-the farm's end-of-horizon **profit** (rubber revenue minus water + fertilizer
-cost), rescaled into ``0..1`` against three baselines on the same scenario:
-``0.0`` = the worst-case operator (spends maximally, never harvests), ``0.5`` =
-a sensible human-like operator (``tend_and_tap``), and ``1.0`` = the best simple
-baseline (tap everything). So a money-losing or do-nothing agent still earns a
-positive reward, a human-level strategy scores ~0.5, and beating it pushes
-toward 1.0.
+This is a *plan-submission* (offline-optimisation) task. Instead of stepping a
+live simulation, the agent writes a **schedule of actions** — a day-indexed
+list-of-lists — and submits it to be scored:
 
-Structure mirrors the blank template: tools are served from an in-process
-FastMCP server started in ``@env.initialize`` and published as an ``mcp``
-capability; tasks are ``@env.template`` async generators that prompt, let the
-agent act, then yield the reward.
+* the outer index is the **day** (0-based) of the run,
+* the inner list is the **chronological actions to take on that day**.
+
+`submit_plan` runs that schedule through the simulator from the pristine starting
+state and returns the resulting profit plus the normalised reward. The agent can
+submit as many times as it likes during a single rollout and inspect the farm at
+any day with `observe_at`, iterating to discover the best schedule. The episode
+reward is the BEST reward across all submissions.
+
+Profit is rescaled to ``0..1`` against baselines on the same scenario: doing
+nothing (or losing money) = 0.0, a sensible human operator = 0.5, and the best
+simple baseline = 1.0. Not submitting a plan also scores 0.0.
 
     hud eval env.py claude
 """
@@ -22,7 +24,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import copy
 import json
 import socket
 
@@ -35,17 +36,28 @@ from Farm.actions import Targets
 env = Environment(name="rubber-farm")
 
 # ---------------------------------------------------------------------------
-# Simulation state. HUD runs one container per evaluation, so a single
-# module-global farm is safe (no in-process parallelism).
+# Scenario state. HUD runs one container per evaluation, so module-globals are
+# safe (no in-process parallelism). There is no *live* farm any more: every
+# observation and score is computed by replaying a plan on a fresh farm built
+# from the immutable spec, so tool calls never interfere with each other.
 # ---------------------------------------------------------------------------
-_sim: dict = {"farm": None, "reward_anchors": (0.0, 0.0, 0.0)}
+_sim: dict = {
+    "spec": None,
+    "reward_anchors": (0.0, 0.0, 0.0),
+    "best": {"reward": 0.0, "profit": None, "submissions": 0, "plan": None},
+}
 
 
-def _farm() -> Farm:
-    farm = _sim["farm"]
-    if farm is None:
-        raise RuntimeError("No farm is running. (A task initialises it.)")
-    return farm
+def _spec():
+    spec = _sim["spec"]
+    if spec is None:
+        raise RuntimeError("No scenario is running. (A task initialises it.)")
+    return spec
+
+
+def _starting_farm() -> Farm:
+    """A fresh farm at day 0 built from the scenario spec (no actions applied)."""
+    return Farm.from_spec(_spec())
 
 
 def _parse_target(target: str) -> Targets:
@@ -59,192 +71,221 @@ def _parse_target(target: str) -> Targets:
     raise ValueError(f"bad target {target!r}: use all|mature|immature|'row,col'")
 
 
-def _years_left(farm: Farm) -> float:
-    total = farm.spec.duration_years * 365
-    return round((total - farm.day) / 365, 2)
+def _price_forecast(spec) -> list[dict]:
+    """Per-year prices for the whole horizon, so timing decisions are plannable."""
+    out: list[dict] = []
+    for i in range(spec.duration_years):
+        y = spec.start_year + i
+        out.append(
+            {
+                "year": y,
+                "rubber_per_lb": round(spec.market_rate.get(y), 4),
+                "water_per_gallon": round(spec.water_cost.get(y), 4),
+                "fertilizer_per_unit": round(spec.fertilizer_cost.get(y), 4),
+            }
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Plan format
+# ---------------------------------------------------------------------------
+# A plan is a schedule of actions keyed by day. The agent may submit it either
+# as a JSON list (index = day) or a JSON object (day-number -> actions):
+#
+#   [ [ {"tool":"tap","on":true,"target":"mature"} ],   # day 0
+#     [],                                               # day 1 (nothing)
+#     ... ]
+#
+#   { "0":   [ {"tool":"tap","target":"mature"} ],
+#     "365": [ {"tool":"fertilize","n":0.2,"p":0.15,"k":0.15,"target":"all"} ] }
+#
+# Each action is a dict with a "tool" key: tap | untap | water | fertilize.
+# Tapping is a *standing* setting (persists across days until changed); watering
+# and fertilizing are one-off on the day they appear. Days you don't mention
+# simply pass with the current tapping settings and no spending.
+
+
+def _as_action_list(actions) -> list:
+    if actions is None:
+        return []
+    if isinstance(actions, dict):  # a lone action for that day
+        return [actions]
+    if not isinstance(actions, list):
+        raise ValueError(f"each day's value must be a list of actions, got {actions!r}")
+    return actions
+
+
+def _parse_plan(plan: str) -> dict[int, list]:
+    """Parse a plan into ``{day: [action, ...]}``. Accepts a list or an object."""
+    data = json.loads(plan)
+    mapping: dict[int, list] = {}
+    if isinstance(data, list):
+        for day, actions in enumerate(data):
+            mapping[day] = _as_action_list(actions)
+    elif isinstance(data, dict):
+        for key, actions in data.items():
+            try:
+                day = int(key)
+            except (TypeError, ValueError):
+                raise ValueError(f"plan keys must be day numbers, got {key!r}")
+            if day < 0:
+                raise ValueError(f"day must be >= 0, got {day}")
+            mapping[day] = _as_action_list(actions)
+    else:
+        raise ValueError(
+            "plan must be a JSON list (index = day) or object (day -> [actions])"
+        )
+    return mapping
+
+
+def _apply_day_action(farm: Farm, action: dict) -> None:
+    """Apply one scheduled action to ``farm`` on the current day."""
+    if not isinstance(action, dict):
+        raise ValueError(f"each action must be an object, got {action!r}")
+    tool = str(action.get("tool", "")).strip().lower()
+    if tool in ("tap", "untap"):
+        on = bool(action.get("on", tool == "tap"))
+        farm.tap(on, _parse_target(action.get("target", "mature")))
+    elif tool == "water":
+        farm.water(float(action.get("gallons", 0.0)), _parse_target(action.get("target", "all")))
+    elif tool == "fertilize":
+        farm.fertilize(
+            float(action.get("n", 0.0)),
+            float(action.get("p", 0.0)),
+            float(action.get("k", 0.0)),
+            _parse_target(action.get("target", "all")),
+        )
+    elif tool in ("wait", "none", ""):
+        return
+    else:
+        raise ValueError(f"unknown action tool {tool!r}: use tap|untap|water|fertilize")
+
+
+def _run_plan(
+    plan_map: dict[int, list], *, until_day: int | None = None, collect_timeline: bool = False
+) -> tuple[Farm, list[dict]]:
+    """Replay ``plan_map`` on a fresh farm up to ``until_day`` (default: the end)."""
+    spec = _spec()
+    farm = Farm.from_spec(spec)
+    horizon = spec.duration_years * 365
+    end = horizon if until_day is None else max(0, min(int(until_day), horizon))
+    timeline: list[dict] = []
+    for day in range(end):
+        for action in plan_map.get(day, []):
+            _apply_day_action(farm, action)
+        farm.step(1)
+        if collect_timeline and farm.day % 365 == 0:
+            e = farm.observe()["economics"]
+            timeline.append(
+                {
+                    "years_elapsed": farm.day // 365,
+                    "profit": e["profit"],
+                    "revenue": e["revenue"],
+                    "cost": e["cost"],
+                    "latex_lb": e["latex_lb"],
+                }
+            )
+    return farm, timeline
 
 
 # ---------------------------------------------------------------------------
 # Agent-facing tools
 # ---------------------------------------------------------------------------
 async def observe() -> str:
-    """Return a JSON snapshot of the whole farm: date, prices, tree stats, economics."""
-    return json.dumps(_farm().observe(), indent=2)
+    """JSON of the STARTING farm (day 0) plus the full per-year price forecast.
+
+    This is your planning baseline: tree ages/girths/health at the start, soil
+    levels, the annual budget, and how rubber/water/fertilizer prices drift over
+    every year of the run (so you can time spending).
+    """
+    spec = _spec()
+    snap = _starting_farm().observe()
+    snap["horizon_days"] = spec.duration_years * 365
+    snap["duration_years"] = spec.duration_years
+    snap["price_forecast"] = _price_forecast(spec)
+    return json.dumps(snap, indent=2)
 
 
 async def render() -> str:
-    """Return a human-readable ASCII map of the farm plus key stats."""
-    return _farm().render()
+    """Human-readable ASCII map of the starting farm plus key stats."""
+    return _starting_farm().render()
 
 
-async def status() -> str:
-    """Return running economics, this year's prices/budget, and years remaining."""
-    farm = _farm()
-    obs = farm.observe()
-    e, p, b = obs["economics"], obs["prices"], obs["budget"]
-    return (
-        f"year={farm.year} years_left={_years_left(farm)} finished={farm.finished}\n"
-        f"prices: rubber ${p['rubber_per_lb']}/lb | water ${p['water_per_gallon']}/gal "
-        f"| fertilizer ${p['fertilizer_per_unit']}/unit\n"
-        f"budget: ${b['remaining_this_year']} left of ${b['annual']} this year\n"
-        f"totals: revenue=${e['revenue']} cost=${e['cost']} profit=${e['profit']} "
-        f"rubber={e['latex_lb']}lb"
-    )
+async def observe_at(day: int, plan: str = "[]") -> str:
+    """Inspect the farm after ``day`` days have elapsed under an (optional) plan.
 
-
-async def water(gallons_per_tree: float, target: str = "all") -> str:
-    """Irrigate trees now (target: all|mature|immature|'row,col').
-
-    You're only charged for water the soil actually absorbs (moisture caps at
-    1.0 per tree) and never more than this year's remaining budget — so an
-    over-sized order is clamped, not punished. A few gallons/tree is plenty.
-    """
-    return json.dumps(_farm().water(gallons_per_tree, _parse_target(target)))
-
-
-async def fertilize(
-    nitrogen: float = 0.0,
-    phosphorus: float = 0.0,
-    potassium: float = 0.0,
-    target: str = "all",
-) -> str:
-    """Add N/P/K nutrient-units to the soil now (target: all|mature|immature|'row,col').
-
-    Each of N/P/K is a 0..1 soil level per tree, so sensible amounts are small
-    (e.g. 0.2 each). You pay only for what the soil absorbs (levels cap at 1.0)
-    and never more than this year's remaining budget, so over-fertilizing just
-    saturates the soil cheaply rather than draining your money.
-    """
-    return json.dumps(
-        _farm().fertilize(nitrogen, phosphorus, potassium, _parse_target(target))
-    )
-
-
-async def tap(on: bool = True, target: str = "mature") -> str:
-    """Start/stop tapping trees for latex. Only tappable (mature) trees yield rubber."""
-    return json.dumps(_farm().tap(on, _parse_target(target)))
-
-
-async def advance(days: int = 365) -> str:
-    """Advance the simulation by N days (default 365), selling latex as it's tapped.
-
-    Standing tapping settings persist; watering/fertilizing are one-off and are
-    not repeated automatically.
-    """
-    farm = _farm()
-    result = farm.step(days)
-    result["years_left"] = _years_left(farm)
-    result["finished"] = farm.finished
-    return json.dumps(result)
-
-
-def _apply_plan_action(sim: Farm, step: dict) -> dict:
-    """Apply one plan step to a (throwaway) farm copy. See ``simulate`` for the schema."""
-    tool = str(step.get("tool", "")).strip().lower()
-    if tool == "advance":
-        return sim.step(int(step.get("days", 365)))
-    if tool == "tap":
-        return sim.tap(bool(step.get("on", True)), _parse_target(step.get("target", "mature")))
-    if tool == "water":
-        return sim.water(float(step.get("gallons", 0.0)), _parse_target(step.get("target", "all")))
-    if tool == "fertilize":
-        return sim.fertilize(
-            float(step.get("n", 0.0)),
-            float(step.get("p", 0.0)),
-            float(step.get("k", 0.0)),
-            _parse_target(step.get("target", "all")),
-        )
-    raise ValueError(f"unknown plan tool {tool!r}: use tap|water|fertilize|advance")
-
-
-async def quote(action: str) -> str:
-    """Preview what a single action would COST right now — without doing it.
-
-    Pass one action as a JSON object using the same schema as a `simulate` step,
-    e.g. ``{"tool": "fertilize", "n": 0.2, "p": 0.15, "k": 0.15, "target": "all"}``
-    or ``{"tool": "water", "gallons": 5, "target": "all"}``.
-
-    Returns how much it would actually cost (you only pay for what the soil
-    absorbs), how much you *requested* vs. what would be applied, and how much of
-    this year's budget would remain. Use it to size spending before committing.
+    Replays ``plan`` (same format as `submit_plan`) on a fresh farm for ``day``
+    days and returns that snapshot — tree health/girth, soil, running economics
+    and budget. Use it to see how a candidate schedule is playing out partway
+    through (e.g. which trees have matured, whether soil is starving). Pass an
+    empty plan ``[]`` to see the no-action trajectory. Nothing is scored here.
     """
     try:
-        step = json.loads(action)
-        if not isinstance(step, dict):
-            raise ValueError("action must be a JSON object")
-    except (json.JSONDecodeError, ValueError) as exc:
-        return json.dumps({"error": f"bad action: {exc}"})
-
-    farm = _farm()
-    sim = copy.deepcopy(farm)
-    try:
-        result = _apply_plan_action(sim, step)
-    except (ValueError, TypeError) as exc:
-        return json.dumps({"error": f"bad action {step!r}: {exc}"})
-
-    result["would_cost"] = round(sim.ledger.cost - farm.ledger.cost, 4)
-    result["preview_only"] = True
-    result["note"] = "Estimate only — nothing was spent or changed on the real farm."
-    return json.dumps(result, indent=2)
-
-
-async def simulate(plan: str) -> str:
-    """Dry-run a batch of actions on a COPY of the farm — no effect on the real run.
-
-    This is your planning sandbox: submit a whole multi-year strategy at once and
-    instantly see how it would play out (no waiting, no committing). Use it to
-    search for a good policy, then execute the winning actions for real.
-
-    ``plan`` is a JSON list of action steps, each a dict with a ``tool`` key —
-    exactly the real tools, replayed in order::
-
-        [
-          {"tool": "tap", "on": true, "target": "mature"},
-          {"tool": "fertilize", "n": 0.2, "p": 0.15, "k": 0.15, "target": "all"},
-          {"tool": "water", "gallons": 5, "target": "all"},
-          {"tool": "advance", "days": 365}
-        ]
-
-    Returns the projected end-of-plan economics, the normalised reward that
-    trajectory would earn (same scale as the final score), and a year-by-year
-    profit timeline. The real farm is untouched.
-    """
-    try:
-        steps = json.loads(plan)
-        if not isinstance(steps, list):
-            raise ValueError("plan must be a JSON list of action steps")
+        plan_map = _parse_plan(plan)
     except (json.JSONDecodeError, ValueError) as exc:
         return json.dumps({"error": f"bad plan: {exc}"})
+    try:
+        farm, _ = _run_plan(plan_map, until_day=int(day))
+    except (ValueError, TypeError) as exc:
+        return json.dumps({"error": f"bad plan: {exc}"})
+    snap = farm.observe()
+    snap["days_elapsed"] = farm.day
+    return json.dumps(snap, indent=2)
 
-    sim = copy.deepcopy(_farm())
-    timeline: list[dict] = []
-    for step in steps:
-        if not isinstance(step, dict):
-            return json.dumps({"error": f"each step must be an object, got {step!r}"})
-        try:
-            result = _apply_plan_action(sim, step)
-        except (ValueError, TypeError) as exc:
-            return json.dumps({"error": f"bad step {step!r}: {exc}"})
-        if str(step.get("tool", "")).lower() == "advance":
-            e = sim.observe()["economics"]
-            timeline.append(
-                {"year": sim.year, "profit": e["profit"], "revenue": e["revenue"], "cost": e["cost"]}
-            )
-        if sim.finished:
-            break
 
-    obs = sim.observe()
-    projected_reward = scale_reward(sim.profit, _sim["reward_anchors"])
+async def submit_plan(plan: str) -> str:
+    """Score a full action schedule: run it through the sim and return profit + reward.
+
+    ``plan`` is day-indexed (the reframed task format):
+    * a JSON LIST whose index is the day, each element a list of that day's
+      actions, e.g. ``[[{"tool":"tap","target":"mature"}], [], ...]``; or
+    * a JSON OBJECT mapping day-number -> actions, e.g.
+      ``{"0": [{"tool":"tap","target":"mature"}],
+         "365": [{"tool":"fertilize","n":0.2,"p":0.15,"k":0.15}]}``.
+
+    Each action is ``{"tool": ...}`` where tool is one of:
+    * ``tap``       — start tapping (``on`` defaults true), ``target`` mature|all|'r,c'
+    * ``untap``     — stop tapping (``target`` ...)
+    * ``water``     — ``gallons`` per tree, ``target`` ...
+    * ``fertilize`` — ``n``/``p``/``k`` (0..1 each), ``target`` ...
+
+    Tapping persists day-to-day; watering/fertilizing apply only on their day.
+    The plan runs from the pristine starting farm, so results are deterministic
+    and fully comparable. You may submit as many times as you like — your
+    EPISODE SCORE is the best reward across all your submissions — so iterate:
+    submit, read the timeline, adjust, resubmit.
+
+    Returns this plan's profit, its normalised reward, whether it's a new best,
+    the best-so-far, and a year-by-year profit timeline.
+    """
+    try:
+        plan_map = _parse_plan(plan)
+    except (json.JSONDecodeError, ValueError) as exc:
+        return json.dumps({"error": f"bad plan: {exc}"})
+    try:
+        farm, timeline = _run_plan(plan_map, collect_timeline=True)
+    except (ValueError, TypeError) as exc:
+        return json.dumps({"error": f"bad plan: {exc}"})
+
+    reward = scale_reward(farm.profit, farm.ledger.latex_lb, _sim["reward_anchors"])
+    best = _sim["best"]
+    best["submissions"] += 1
+    is_new_best = reward > best["reward"]
+    if is_new_best:
+        best.update(reward=reward, profit=farm.profit, plan=plan_map)
+
+    e = farm.observe()["economics"]
     return json.dumps(
         {
-            "projected_profit": obs["economics"]["profit"],
-            "projected_reward": round(projected_reward, 4),
-            "final_year": sim.year,
-            "finished": sim.finished,
-            "economics": obs["economics"],
-            "trees": obs["trees"],
-            "timeline": timeline[-40:],
-            "note": "Dry run on a farm copy — the real farm is unchanged.",
+            "profit": e["profit"],
+            "reward": round(reward, 4),
+            "is_new_best": is_new_best,
+            "best_reward_so_far": round(best["reward"], 4),
+            "submission_number": best["submissions"],
+            "economics": e,
+            "timeline": timeline,
+            "note": "Your episode score is the BEST reward over all submit_plan calls.",
         },
         indent=2,
     )
@@ -282,10 +323,7 @@ async def _up() -> None:
     global _MCP_PORT, _MCP_SERVER_TASK
     if _MCP_SERVER_TASK is None:
         server = FastMCP(name="farm")
-        for tool in (
-            observe, render, status, water, fertilize, tap,
-            advance, quote, simulate,
-        ):
+        for tool in (observe, render, observe_at, submit_plan):
             server.tool(tool)
         _MCP_PORT = _free_port()
         _MCP_SERVER_TASK = asyncio.create_task(
@@ -307,58 +345,64 @@ async def _down() -> None:
         with contextlib.suppress(asyncio.CancelledError):
             await _MCP_SERVER_TASK
         _MCP_SERVER_TASK = None
-    _sim["farm"] = None
+    _sim["spec"] = None
 
 
 # ---------------------------------------------------------------------------
-# Task: manage the farm for its full horizon, graded on profit
+# Task: design the best {years}-year action schedule, graded on profit
 # ---------------------------------------------------------------------------
 _PROMPT = """\
-You are managing a rubber-tree plantation for {years} years (years {y0}-{y1}).
-Goal: MAXIMISE PROFIT = rubber sales revenue minus your spending on water and
-fertilizer. Rubber sells at the market rate each year; tapping mature trees is
-how you earn. Every dollar you DON'T spend stays as profit.
+You are designing the operating schedule for a rubber-tree plantation over
+{years} years (years {y0}-{y1}). You do NOT step through time live; instead you
+write a SCHEDULE OF ACTIONS, submit it to be simulated, read the resulting
+profit, and refine it. Iterate as many times as you like — your score is the
+BEST plan you submit.
+
+Goal: MAXIMISE PROFIT = rubber sales revenue minus spending on water and
+fertilizer. Tapping mature trees earns money; every dollar you don't spend stays
+as profit.
+
+The plan format (day-indexed):
+- A JSON list whose INDEX is the day (0-based), each element a list of the
+  actions to take that day; or a JSON object mapping a day-number to its
+  actions. Days you omit just pass with no spending and your current tapping.
+- Actions (objects with a "tool"):
+  * {{"tool":"tap","target":"mature"}}      start tapping (persists day to day)
+  * {{"tool":"untap","target":"all"}}       stop tapping
+  * {{"tool":"water","gallons":5,"target":"all"}}
+  * {{"tool":"fertilize","n":0.2,"p":0.15,"k":0.15,"target":"all"}}
+- target is all|mature|immature|'row,col'. There are 365 days per year, so day
+  365 is the start of year 2, 730 of year 3, etc.
 
 How the farm works:
-- Trees grow trunk girth over years and become *tappable* at ~6 years / ~45 cm.
-- Tapping yields latex daily; tapping continuously wears down the tapping panel
-  (lower yield) while resting lets it recover. Newly matured trees aren't tapped
-  until you tap them.
-- Trees need soil moisture (rain + irrigation) and N/P/K nutrients (used up by
-  growth, replenished by fertilizer). Starving either lowers health -> lower
-  growth and yield. Trees die of old age around 28-34 years.
-- Prices (rubber $/lb, water $/gal, fertilizer $/unit) drift year to year.
+- Trees become tappable at ~6 years / ~45 cm girth. Tapping yields latex daily;
+  tapping every day wears the panel down (lower yield), resting heals it. Newly
+  matured trees are not tapped until you tap them, so re-tap as they mature.
+- Trees need soil moisture (rain + irrigation) and N/P/K nutrients; starving
+  either lowers health -> lower growth and yield. Trees die of old age ~28-34y.
+- Prices drift year to year (see the price_forecast in `observe`).
 
-How costs add up (READ THIS before spending):
-- WATER cost  = (gallons the soil actually absorbs) x water $/gal. Moisture caps
-  at 1.0 per tree, so gallons beyond what the soil can hold are not charged.
-- FERTILIZER cost = (N+P+K units the soil actually absorbs) x fertilizer $/unit.
-  Each of N/P/K is a 0..1 soil level per tree and caps at 1.0, so values are
-  SMALL — 0.2 each is a normal top-up, not 5 or 50.
-- Both draw from a fixed ANNUAL BUDGET (see `status`/`observe`). Spending is
-  capped at the remaining budget; an over-order is scaled down, never overspent,
-  and the budget resets each year. Every dollar saved stays as profit.
-- Worked example: fertilizing all 36 trees with 0.2 N/P/K each (~0.6 units/tree)
-  is ~21.6 units; at ~$2.5/unit that's ~$54. Annual tap revenue is only on the
-  order of $100-300, so feed in small amounts and let rain do most of the
-  watering.
-- Before committing, call `quote` to preview an action's exact cost, or
-  `simulate` to dry-run a whole strategy.
+How costs add up:
+- WATER cost = (gallons the soil absorbs) x water $/gal; FERTILIZER cost =
+  (N+P+K units absorbed) x fertilizer $/unit. Moisture and each of N/P/K cap at
+  1.0 per tree, so amounts are SMALL (0.2 each is a normal feed, not 5 or 50)
+  and over-ordering is not charged for what the soil can't hold.
+- A fixed ANNUAL BUDGET caps yearly spending; over-orders are scaled down, never
+  overspent, and it resets each year. Annual tap revenue is on the order of
+  $100-300, so feed sparingly and let rain do most of the watering.
 
-Tools: observe (JSON state), render (ASCII map), status (economics + prices +
-budget + years left), water, fertilize, tap, advance(days), `quote`, and
-`simulate`.
-- `advance(days)` moves time forward; standing tapping settings persist, but
-  watering/fertilizing are one-off (not repeated automatically).
-- `quote(action)` previews what a single action would cost right now, without
-  spending or changing anything.
-- `simulate(plan)` DRY-RUNS a batch of actions on a throwaway copy of the farm
-  and reports the projected profit + reward + year-by-year timeline WITHOUT
-  waiting or affecting the real run. Use it to search for a strong multi-year
-  strategy first, then execute the winning actions for real.
+Tools:
+- `observe` — starting farm + full per-year price forecast (your planning data).
+- `render` — ASCII map of the starting farm.
+- `observe_at(day, plan)` — replay a candidate plan for `day` days and inspect
+  the farm then (tree maturity, soil, running economics). Nothing is scored.
+- `submit_plan(plan)` — simulate a full schedule and get its profit + reward +
+  year-by-year timeline. Call it repeatedly; the best result is your score.
 
-When you've finished managing the full {years} years, reply with a short summary
-of your strategy and final profit.
+Workflow: read `observe`, draft a schedule, `submit_plan`, study the timeline,
+adjust (re-tap newly matured trees, feed when soil is low, stop wasteful spend),
+and resubmit until the reward stops improving. Finish with a short summary of
+your best strategy and its profit.
 
 Starting state:
 {render}
@@ -367,7 +411,7 @@ Starting state:
 
 @env.template(
     id="rubber-farm",
-    description="Operate a rubber plantation for ~30 years; reward = normalised profit.",
+    description="Design a ~30-year rubber-farm action schedule; reward = normalised profit.",
 )
 async def rubber_farm(
     seed: int = 0,
@@ -375,49 +419,56 @@ async def rubber_farm(
     cols: int = 6,
     duration_years: int = 30,
 ):
-    spec = default_spec(
-        rows=rows, cols=cols, seed=seed, duration_years=duration_years
-    )
-    farm = Farm.from_spec(spec)
-    _sim["farm"] = farm
-    # Reward anchors for this exact scenario: (worst-case, human, best-baseline)
-    # profits mapping to (0.0, 0.5, 1.0). Even poor play scores above 0; a
-    # human-like strategy lands near 0.5; beating it climbs toward 1.0.
+    spec = default_spec(rows=rows, cols=cols, seed=seed, duration_years=duration_years)
+    _sim["spec"] = spec
     _sim["reward_anchors"] = reward_anchors(spec)
+    _sim["best"] = {"reward": 0.0, "profit": None, "submissions": 0, "plan": None}
 
     yield _PROMPT.format(
         years=duration_years,
         y0=spec.start_year,
         y1=spec.start_year + duration_years,
-        render=farm.render(),
+        render=_starting_farm().render(),
     )
 
-    yield scale_reward(farm.profit, _sim["reward_anchors"])
+    # Episode reward = the best plan the agent submitted this rollout. Never
+    # submitting scores a hard 0.0 — the same as submitting a do-nothing plan
+    # (profit 0 maps to reward 0.0), so credit requires actually harvesting.
+    best = _sim["best"]
+    yield best["reward"] if best["submissions"] > 0 else 0.0
 
 
 if __name__ == "__main__":
-    # No-model smoke test: drive the tools directly and print the reward a
-    # baseline-quality run would earn (should be ~1.0 since it matches baseline).
+    # No-model smoke test: build a sensible schedule, submit it, print the reward.
     async def _smoke() -> None:
         gen = rubber_farm.func(seed=0)
         prompt = await gen.asend(None)
-        print(prompt[:600], "...\n")
+        print(prompt[:500], "...\n")
 
-        # Play the same heuristic the reference uses, via the tools.
-        while not _farm().finished:
-            obs = json.loads(await observe())
-            a = obs["averages"]
-            await tap(True, "mature")
-            if a["moisture"] < 0.45:
-                await water(5, "all")
-            if a["nutrients"] < 0.35:
-                await fertilize(0.2, 0.15, 0.15, "all")
-            await advance(365)
+        # A "tend & tap" schedule: tap mature trees at the start of every year and
+        # feed/water a little each year. (Re-tapping each year picks up trees that
+        # have newly matured.)
+        plan: dict[str, list] = {}
+        for yr in range(30):
+            day = yr * 365
+            plan[str(day)] = [
+                {"tool": "tap", "target": "mature"},
+                {"tool": "water", "gallons": 5, "target": "all"},
+                {"tool": "fertilize", "n": 0.2, "p": 0.15, "k": 0.15, "target": "all"},
+            ]
 
-        print("final status:", await status())
-        reward = await gen.asend("Tapped everything, fertilized only when low.")
+        result = json.loads(await submit_plan(json.dumps(plan)))
+        print("submit_plan ->", {k: result[k] for k in ("profit", "reward", "is_new_best")})
+        print("timeline tail:", result["timeline"][-2:])
+
+        # observe_at midway through the same plan
+        mid = json.loads(await observe_at(365 * 10, json.dumps(plan)))
+        print("year 10 snapshot: tappable=%s health=%s profit=%s" % (
+            mid["trees"]["tappable"], mid["averages"]["health"], mid["economics"]["profit"]))
+
+        reward = await gen.asend("Submitted a tend-and-tap schedule.")
         anchors = tuple(round(a, 2) for a in _sim["reward_anchors"])
-        print("reward anchors (worst/human/best):", anchors)
-        print("reward:", round(reward, 4))
+        print("reward anchors (loss_floor/ceil):", anchors)
+        print("episode reward (best submitted):", round(reward, 4))
 
     asyncio.run(_smoke())
