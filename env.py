@@ -213,13 +213,17 @@ async def render() -> str:
 
 
 async def observe_at(day: int, plan: str = "[]") -> str:
-    """Inspect the farm after ``day`` days have elapsed under an (optional) plan.
+    """Inspect the farm's PHYSICAL state after ``day`` days under an (optional) plan.
 
     Replays ``plan`` (same format as `submit_plan`) on a fresh farm for ``day``
-    days and returns that snapshot — tree health/girth, soil, running economics
-    and budget. Use it to see how a candidate schedule is playing out partway
-    through (e.g. which trees have matured, whether soil is starving). Pass an
-    empty plan ``[]`` to see the no-action trajectory. Nothing is scored here.
+    days and returns that snapshot — tree counts/maturity, girth, health, panel,
+    soil moisture/nutrients, prices, and budget left that year. Use it to see how
+    a candidate schedule is playing out (which trees have matured and need
+    tapping, whether soil is starving). Pass an empty plan ``[]`` for the
+    no-action trajectory.
+
+    NOTE: this does NOT report profit, revenue, or reward — those come only from
+    `submit_plan`. Observing alone never scores; you must `submit_plan` to be graded.
     """
     try:
         plan_map = _parse_plan(plan)
@@ -230,7 +234,9 @@ async def observe_at(day: int, plan: str = "[]") -> str:
     except (ValueError, TypeError) as exc:
         return json.dumps({"error": f"bad plan: {exc}"})
     snap = farm.observe()
+    snap.pop("economics", None)  # profit/reward are revealed only by submit_plan
     snap["days_elapsed"] = farm.day
+    snap["note"] = "Physical state only — call submit_plan to learn profit & reward."
     return json.dumps(snap, indent=2)
 
 
@@ -354,9 +360,15 @@ async def _down() -> None:
 _PROMPT = """\
 You are designing the operating schedule for a rubber-tree plantation over
 {years} years (years {y0}-{y1}). You do NOT step through time live; instead you
-write a SCHEDULE OF ACTIONS, submit it to be simulated, read the resulting
-profit, and refine it. Iterate as many times as you like — your score is the
-BEST plan you submit.
+write a SCHEDULE OF ACTIONS and call `submit_plan` to simulate it and get its
+profit. Then refine and submit again. Iterate as many times as you like — your
+score is the BEST plan you submit.
+
+CRITICAL: `submit_plan` is the ONLY thing that scores you. If you never call
+`submit_plan`, you get 0 — observing, reasoning, or describing a plan in text
+all score 0. So submit a first plan EARLY (even a rough one), read its profit
+and timeline, then keep submitting improved versions until the reward stops
+rising. Do not end your turn until you have submitted at least one plan.
 
 Goal: MAXIMISE PROFIT = rubber sales revenue minus spending on water and
 fertilizer. Tapping mature trees earns money; every dollar you don't spend stays
@@ -392,17 +404,19 @@ How costs add up:
   $100-300, so feed sparingly and let rain do most of the watering.
 
 Tools:
+- `submit_plan(plan)` — THE scoring tool. Simulates a full schedule and returns
+  its profit, reward, and year-by-year timeline. Call it repeatedly; your score
+  is the best submission.
 - `observe` — starting farm + full per-year price forecast (your planning data).
 - `render` — ASCII map of the starting farm.
-- `observe_at(day, plan)` — replay a candidate plan for `day` days and inspect
-  the farm then (tree maturity, soil, running economics). Nothing is scored.
-- `submit_plan(plan)` — simulate a full schedule and get its profit + reward +
-  year-by-year timeline. Call it repeatedly; the best result is your score.
+- `observe_at(day, plan)` — inspect a candidate plan's PHYSICAL state at a given
+  day (which trees have matured, soil/health). Does NOT report profit and does
+  NOT score — it's only for debugging a plan between submissions.
 
-Workflow: read `observe`, draft a schedule, `submit_plan`, study the timeline,
-adjust (re-tap newly matured trees, feed when soil is low, stop wasteful spend),
-and resubmit until the reward stops improving. Finish with a short summary of
-your best strategy and its profit.
+Workflow: glance at `observe`, draft a schedule, `submit_plan` immediately, study
+the returned timeline, adjust (re-tap newly matured trees, feed when soil is low,
+cut wasteful spend), and resubmit until the reward stops improving. Then finish
+with a short summary of your best strategy and its profit.
 
 Starting state:
 {render}
@@ -461,10 +475,10 @@ if __name__ == "__main__":
         print("submit_plan ->", {k: result[k] for k in ("profit", "reward", "is_new_best")})
         print("timeline tail:", result["timeline"][-2:])
 
-        # observe_at midway through the same plan
+        # observe_at midway through the same plan (physical state only)
         mid = json.loads(await observe_at(365 * 10, json.dumps(plan)))
-        print("year 10 snapshot: tappable=%s health=%s profit=%s" % (
-            mid["trees"]["tappable"], mid["averages"]["health"], mid["economics"]["profit"]))
+        print("year 10 snapshot: tappable=%s health=%s (no economics here)" % (
+            mid["trees"]["tappable"], mid["averages"]["health"]))
 
         reward = await gen.asend("Submitted a tend-and-tap schedule.")
         anchors = tuple(round(a, 2) for a in _sim["reward_anchors"])
