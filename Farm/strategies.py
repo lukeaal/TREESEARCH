@@ -37,6 +37,18 @@ def tend_and_tap(farm: Farm) -> None:
         farm.fertilize(nitrogen=0.2, phosphorus=0.15, potassium=0.15, targets="all")
 
 
+def worst_case(farm: Farm) -> None:
+    """The worst possible operator: spend maximally on inputs and never harvest.
+
+    Maximum cost, zero revenue -> the most negative profit achievable. This is
+    the reward's 0.0 anchor, so any agent that actually taps (earns revenue) or
+    simply spends less ends up strictly above it.
+    """
+    farm.tap(on=False, targets="all")
+    farm.water(gallons_per_tree=25, targets="all")
+    farm.fertilize(nitrogen=0.5, phosphorus=0.5, potassium=0.5, targets="all")
+
+
 def run_policy(spec: FarmSpec, policy: Policy, period_days: int = 365) -> Farm:
     """Run ``policy`` to the end of the scenario and return the finished farm.
 
@@ -53,3 +65,45 @@ def run_policy(spec: FarmSpec, policy: Policy, period_days: int = 365) -> Farm:
 def reference_profit(spec: FarmSpec, policy: Policy = tend_and_tap) -> float:
     """Profit a baseline policy earns on ``spec`` — used to scale RL rewards."""
     return run_policy(spec, policy).profit
+
+
+def best_baseline_profit(spec: FarmSpec) -> float:
+    """Profit of the strongest simple baseline (the reward's 1.0 anchor).
+
+    On these scenarios "just tap everything" (``tap_only``) usually beats the
+    fertilizing operator, so we take the max to be safe.
+    """
+    return max(reference_profit(spec, tap_only), reference_profit(spec, tend_and_tap))
+
+
+def reward_anchors(spec: FarmSpec) -> tuple[float, float, float]:
+    """``(floor, human, ceil)`` profit anchors for the env reward.
+
+    - ``floor`` = the worst-case operator (max spend, no harvest) -> reward 0.0.
+    - ``human`` = a sensible human-like operator (``tend_and_tap``) -> reward 0.5.
+    - ``ceil``  = the best simple baseline (tap everything) -> reward 1.0.
+
+    See :func:`scale_reward` for how a profit maps through these. The middle
+    anchor lets us pin "what a human would do" at 0.5, with room to score lower
+    (poor play, but still positive) or higher (beating the human baseline).
+    """
+    floor = reference_profit(spec, worst_case)
+    human = reference_profit(spec, tend_and_tap)
+    ceil = max(best_baseline_profit(spec), human)
+    return floor, human, ceil
+
+
+def scale_reward(profit: float, anchors: tuple[float, float, float]) -> float:
+    """Map ``profit`` to ``0..1`` through ``(floor, human, ceil)`` piecewise.
+
+    Linear from floor->human over ``0.0..0.5`` and human->ceil over ``0.5..1.0``,
+    so the human baseline lands exactly at 0.5. Clamped to ``[0, 1]``.
+    """
+    floor, human, ceil = anchors
+    if profit <= human:
+        denom = human - floor
+        reward = 0.5 * (profit - floor) / denom if denom > 0 else 0.0
+    else:
+        denom = ceil - human
+        reward = 0.5 + 0.5 * (profit - human) / denom if denom > 0 else 1.0
+    return max(0.0, min(1.0, reward))

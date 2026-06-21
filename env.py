@@ -3,7 +3,12 @@
 The agent acts on a living :class:`Farm.Farm` simulation through MCP tools
 (observe / render / water / fertilize / tap / advance / status). The reward is
 the farm's end-of-horizon **profit** (rubber revenue minus water + fertilizer
-cost), normalised against a sensible baseline operator so it lands in ``0..1``.
+cost), rescaled into ``0..1`` against three baselines on the same scenario:
+``0.0`` = the worst-case operator (spends maximally, never harvests), ``0.5`` =
+a sensible human-like operator (``tend_and_tap``), and ``1.0`` = the best simple
+baseline (tap everything). So a money-losing or do-nothing agent still earns a
+positive reward, a human-level strategy scores ~0.5, and beating it pushes
+toward 1.0.
 
 Structure mirrors the blank template: tools are served from an in-process
 FastMCP server started in ``@env.initialize`` and published as an ``mcp``
@@ -23,7 +28,7 @@ import socket
 from hud import Environment
 from hud.capabilities import Capability
 
-from Farm import Farm, default_spec, reference_profit
+from Farm import Farm, default_spec, reward_anchors, scale_reward
 from Farm.actions import Targets
 
 env = Environment(name="rubber-farm")
@@ -32,7 +37,7 @@ env = Environment(name="rubber-farm")
 # Simulation state. HUD runs one container per evaluation, so a single
 # module-global farm is safe (no in-process parallelism).
 # ---------------------------------------------------------------------------
-_sim: dict = {"farm": None, "reference": 0.0}
+_sim: dict = {"farm": None, "reward_anchors": (0.0, 0.0, 0.0)}
 
 
 def _farm() -> Farm:
@@ -224,9 +229,10 @@ async def rubber_farm(
     )
     farm = Farm.from_spec(spec)
     _sim["farm"] = farm
-    # Profit a sensible baseline operator earns on this exact scenario; used to
-    # scale the reward so ~baseline -> 1.0 and losing money -> 0.0.
-    _sim["reference"] = reference_profit(spec)
+    # Reward anchors for this exact scenario: (worst-case, human, best-baseline)
+    # profits mapping to (0.0, 0.5, 1.0). Even poor play scores above 0; a
+    # human-like strategy lands near 0.5; beating it climbs toward 1.0.
+    _sim["reward_anchors"] = reward_anchors(spec)
 
     yield _PROMPT.format(
         years=duration_years,
@@ -235,10 +241,7 @@ async def rubber_farm(
         render=farm.render(),
     )
 
-    profit = farm.profit
-    reference = _sim["reference"]
-    reward = profit / reference if reference > 0 else (1.0 if profit > 0 else 0.0)
-    yield max(0.0, min(1.0, reward))
+    yield scale_reward(farm.profit, _sim["reward_anchors"])
 
 
 if __name__ == "__main__":
@@ -262,7 +265,8 @@ if __name__ == "__main__":
 
         print("final status:", await status())
         reward = await gen.asend("Tapped everything, fertilized only when low.")
-        print("reference profit:", round(_sim["reference"], 2))
+        anchors = tuple(round(a, 2) for a in _sim["reward_anchors"])
+        print("reward anchors (worst/human/best):", anchors)
         print("reward:", round(reward, 4))
 
     asyncio.run(_smoke())
