@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+.claude/
+.hud/
+.hud_eval.toml
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+uv.lock

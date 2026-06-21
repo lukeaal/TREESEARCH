@@ -1,0 +1,12 @@
+.venv/
+.git/
+.gitignore
+.hud/
+.hud_eval.toml
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+tests/
+README.md
