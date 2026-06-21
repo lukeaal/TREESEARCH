@@ -17,7 +17,7 @@ _AGENT_CONFIG = {"max_steps": 80}
 
 # A spread of scenarios (different plantations) on the default 6x6 / 30-year farm.
 tasks = []
-for _seed in range(6):
+for _seed in range(1):
     _t = rubber_farm(seed=_seed)
     _t.slug = f"rubber-farm-seed-{_seed}"
     _t.agent_config = _AGENT_CONFIG
