@@ -101,6 +101,10 @@ class FarmSpec:
     duration_years: int = 30
     seed: int = 0
     noise: float = 0.12  # fractional spread used for init + day-to-day jitter
+    # Hard ceiling on what an operator may spend (water + fertilizer) within a
+    # single calendar year. Caps the downside: the worst you can do is burn the
+    # whole budget every year, and every unspent dollar stays as profit.
+    annual_budget: float = 800.0
 
     # --- convenience constructors ------------------------------------------
     @classmethod
@@ -157,6 +161,7 @@ def default_spec(
     seed: int = 0,
     duration_years: int = 30,
     start_year: int = 2025,
+    annual_budget: float = 800.0,
 ) -> FarmSpec:
     """A reasonable starter scenario: a fully planted plot of mixed-age trees.
 
@@ -212,4 +217,5 @@ def default_spec(
         duration_years=duration_years,
         seed=seed,
         noise=0.12,
+        annual_budget=annual_budget,
     )

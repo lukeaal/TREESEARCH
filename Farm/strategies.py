@@ -76,10 +76,16 @@ def best_baseline_profit(spec: FarmSpec) -> float:
     return max(reference_profit(spec, tap_only), reference_profit(spec, tend_and_tap))
 
 
+# Reward earned at the worst-case anchor. Kept above 0 on purpose: a forgiving
+# floor means even poor play gets a little signal (and a gradient just below the
+# floor), instead of a flat-zero desert that gives RL nothing to climb.
+SOFT_FLOOR_REWARD = 0.1
+
+
 def reward_anchors(spec: FarmSpec) -> tuple[float, float, float]:
     """``(floor, human, ceil)`` profit anchors for the env reward.
 
-    - ``floor`` = the worst-case operator (max spend, no harvest) -> reward 0.0.
+    - ``floor`` = the worst-case operator (max spend, no harvest) -> reward 0.1.
     - ``human`` = a sensible human-like operator (``tend_and_tap``) -> reward 0.5.
     - ``ceil``  = the best simple baseline (tap everything) -> reward 1.0.
 
@@ -96,14 +102,26 @@ def reward_anchors(spec: FarmSpec) -> tuple[float, float, float]:
 def scale_reward(profit: float, anchors: tuple[float, float, float]) -> float:
     """Map ``profit`` to ``0..1`` through ``(floor, human, ceil)`` piecewise.
 
-    Linear from floor->human over ``0.0..0.5`` and human->ceil over ``0.5..1.0``,
-    so the human baseline lands exactly at 0.5. Clamped to ``[0, 1]``.
+    - ``human..ceil`` -> ``0.5..1.0`` (beating the human baseline climbs to 1.0).
+    - ``floor..human`` -> ``SOFT_FLOOR_REWARD..0.5`` (poor-but-trying play still
+      earns a meaningful positive reward; do-nothing lands comfortably above 0).
+    - below ``floor`` -> a gentle tail from ``SOFT_FLOOR_REWARD`` down to 0 over
+      another floor-span, so catastrophic spending is penalised *smoothly*
+      instead of slamming to a hard, gradient-free zero.
+
+    Clamped to ``[0, 1]``.
     """
     floor, human, ceil = anchors
-    if profit <= human:
-        denom = human - floor
-        reward = 0.5 * (profit - floor) / denom if denom > 0 else 0.0
-    else:
+    if profit >= human:
         denom = ceil - human
         reward = 0.5 + 0.5 * (profit - human) / denom if denom > 0 else 1.0
+    elif profit >= floor:
+        denom = human - floor
+        frac = (profit - floor) / denom if denom > 0 else 0.0
+        reward = SOFT_FLOOR_REWARD + (0.5 - SOFT_FLOOR_REWARD) * frac
+    else:
+        # Below the worst-case anchor: decay to 0 over a span the size of |floor|.
+        span = abs(floor) if floor else 1.0
+        frac = max(0.0, 1.0 + (profit - floor) / span)
+        reward = SOFT_FLOOR_REWARD * frac
     return max(0.0, min(1.0, reward))

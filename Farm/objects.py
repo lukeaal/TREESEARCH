@@ -303,6 +303,9 @@ class Farm:
         self.weather_rng = random.Random(spec.seed ^ 0x9E3779B9)
         self.day = 0  # days elapsed since the start of the run
         self.ledger = Ledger()
+        # Spending booked against each calendar year, so the annual budget cap
+        # resets automatically as the calendar rolls over.
+        self._spend_by_year: dict[int, float] = {}
         self.grid: list[list[RubberTree | None]] = [
             [None for _ in range(spec.cols)] for _ in range(spec.rows)
         ]
@@ -383,6 +386,23 @@ class Farm:
     def fertilizer_price(self) -> float:
         return self.spec.fertilizer_cost.get(self.year)
 
+    # ------------------------------------------------------------- budget
+    @property
+    def annual_budget(self) -> float:
+        return self.spec.annual_budget
+
+    @property
+    def spent_this_year(self) -> float:
+        return self._spend_by_year.get(self.year, 0.0)
+
+    @property
+    def remaining_budget(self) -> float:
+        """Money still available to spend in the current calendar year."""
+        return max(0.0, self.annual_budget - self.spent_this_year)
+
+    def _book_spend(self, amount: float) -> None:
+        self._spend_by_year[self.year] = self.spent_this_year + amount
+
     # ------------------------------------------------------------ tree access
     def trees(self):
         """Iterate over every living-or-dead tree on the grid."""
@@ -415,6 +435,13 @@ class Farm:
                 out.append(tree)
         return out
 
+    def _affordable_factor(self, requested_cost: float) -> float:
+        """Fraction of a requested spend that still fits in this year's budget."""
+        remaining = self.remaining_budget
+        if requested_cost <= 0:
+            return 0.0
+        return min(1.0, remaining / requested_cost)
+
     # --------------------------------------------------------------- actions
     def apply(self, action: Action) -> dict:
         """Apply one action immediately. Returns a small summary dict."""
@@ -429,24 +456,63 @@ class Farm:
         raise TypeError(f"unknown action: {action!r}")
 
     def _do_water(self, action: Water) -> dict:
+        # Two safety rails make spending forgiving: (1) you only pay for water the
+        # soil actually absorbs (moisture caps at 1.0), and (2) the spend is
+        # clamped to this year's remaining budget, so an over-eager order is
+        # scaled down to what you can afford instead of blowing past the cap.
         targets = self._resolve_targets(action.targets)
+        requested = action.gallons_per_tree * len(targets)
+        factor = self._affordable_factor(requested * self.water_price)
+        gpt = action.gallons_per_tree * factor
+        gallons = 0.0
         for tree in targets:
-            tree.water(action.gallons_per_tree)
-        gallons = action.gallons_per_tree * len(targets)
+            before = tree.moisture
+            tree.water(gpt)
+            gallons += (tree.moisture - before) / GALLONS_TO_MOISTURE
         cost = gallons * self.water_price
         self.ledger.water_gallons += gallons
         self.ledger.water_cost += cost
-        return {"action": "water", "trees": len(targets), "gallons": gallons, "cost": cost}
+        self._book_spend(cost)
+        return {
+            "action": "water",
+            "trees": len(targets),
+            "gallons": round(gallons, 3),
+            "requested_gallons": round(requested, 3),
+            "cost": round(cost, 4),
+            "budget_remaining": round(self.remaining_budget, 2),
+            "budget_capped": factor < 1.0,
+        }
 
     def _do_fertilize(self, action: Fertilize) -> dict:
+        # Same two rails as watering: charge only for nutrients the soil absorbs
+        # (each of N/P/K caps at 1.0 per tree), and clamp the order to the annual
+        # budget. Over-fertilizing is therefore forgiven instead of catastrophic.
         targets = self._resolve_targets(action.targets)
+        requested = action.total_units * len(targets)
+        factor = self._affordable_factor(requested * self.fertilizer_price)
+        n, p, k = (
+            action.nitrogen * factor,
+            action.phosphorus * factor,
+            action.potassium * factor,
+        )
+        units = 0.0
         for tree in targets:
-            tree.fertilize(action.nitrogen, action.phosphorus, action.potassium)
-        units = action.total_units * len(targets)
+            before = tree.nitrogen + tree.phosphorus + tree.potassium
+            tree.fertilize(n, p, k)
+            units += (tree.nitrogen + tree.phosphorus + tree.potassium) - before
         cost = units * self.fertilizer_price
         self.ledger.fertilizer_units += units
         self.ledger.fertilizer_cost += cost
-        return {"action": "fertilize", "trees": len(targets), "units": units, "cost": cost}
+        self._book_spend(cost)
+        return {
+            "action": "fertilize",
+            "trees": len(targets),
+            "units": round(units, 4),
+            "requested_units": round(requested, 4),
+            "cost": round(cost, 4),
+            "budget_remaining": round(self.remaining_budget, 2),
+            "budget_capped": factor < 1.0,
+        }
 
     def _do_tap(self, action: Tap) -> dict:
         targets = self._resolve_targets(action.targets)
@@ -551,6 +617,11 @@ class Farm:
                 "moisture": round(avg([t.moisture for t in living]), 3),
                 "nutrients": round(avg([t.nutrient_level for t in living]), 3),
             },
+            "budget": {
+                "annual": round(self.annual_budget, 2),
+                "spent_this_year": round(self.spent_this_year, 2),
+                "remaining_this_year": round(self.remaining_budget, 2),
+            },
             "economics": {
                 "revenue": round(self.ledger.revenue, 2),
                 "cost": round(self.ledger.cost, 2),
@@ -591,6 +662,11 @@ class Farm:
         lines.append(
             f"Avg: age {a['age_years']}y  girth {a['girth_cm']}cm  health {a['health']}  "
             f"panel {a['panel_health']}  moisture {a['moisture']}  nutrients {a['nutrients']}"
+        )
+        b = obs["budget"]
+        lines.append(
+            f"Budget: ${b['remaining_this_year']}/{b['annual']} left this year "
+            f"(spent ${b['spent_this_year']})"
         )
         e = obs["economics"]
         lines.append(
