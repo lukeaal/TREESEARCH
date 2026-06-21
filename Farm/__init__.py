@@ -24,6 +24,13 @@ Quick start::
 from .actions import Action, Fertilize, Tap, Targets, Wait, Water
 from .objects import Farm, Ledger, RubberTree, Weather
 from .spec import FarmSpec, Schedule, TreeSpec, default_spec
+from .strategies import (
+    do_nothing,
+    reference_profit,
+    run_policy,
+    tap_only,
+    tend_and_tap,
+)
 
 __all__ = [
     "Farm",
@@ -40,4 +47,9 @@ __all__ = [
     "Tap",
     "Wait",
     "Targets",
+    "run_policy",
+    "reference_profit",
+    "do_nothing",
+    "tap_only",
+    "tend_and_tap",
 ]

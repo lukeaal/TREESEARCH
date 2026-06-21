@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .actions import Action, Fertilize, Tap, Targets, Wait, Water
 from .spec import FarmSpec, TreeSpec
@@ -104,6 +104,12 @@ class RubberTree:
     last_latex_lb: float = 0.0
     cumulative_latex_lb: float = 0.0
 
+    # Per-tree RNG so each tree's day-to-day noise is independent of every other
+    # tree and of the actions taken. The Farm seeds this from (seed, row, col).
+    rng: random.Random = field(
+        default_factory=random.Random, repr=False, compare=False
+    )
+
     # ----------------------------------------------------------------- traits
     @property
     def age_years(self) -> float:
@@ -153,7 +159,7 @@ class RubberTree:
         span = MAX_AGE_DAYS - SENESCENCE_AGE_DAYS
         return _clamp(1.0 - (self.age_days - SENESCENCE_AGE_DAYS) / span)
 
-    def step(self, weather: Weather, rng: random.Random, noise: float) -> float:
+    def step(self, weather: Weather, noise: float) -> float:
         """Advance one day. Returns latex (lb) collected from this tree today."""
         self.last_latex_lb = 0.0
         if not self.alive:
@@ -161,13 +167,22 @@ class RubberTree:
 
         self.age_days += 1
 
-        def jitter() -> float:
-            return 1.0 + rng.gauss(0.0, noise)
+        # Draw every random for the day up front, so the count of RNG draws is
+        # the same whether or not the tree is being tapped. That keeps each
+        # tree's stochastic stream identical across different operator policies,
+        # which is what makes rewards comparable for RL.
+        r = self.rng
+        evap_j = 1.0 + r.gauss(0.0, noise)
+        health_noise = r.gauss(0.0, noise * 0.05)
+        growth_j = 1.0 + r.gauss(0.0, noise)
+        draw_j = 1.0 + r.gauss(0.0, noise)
+        latex_j = max(0.0, 1.0 + r.gauss(0.0, noise))
+        panel_j = 1.0 + r.gauss(0.0, noise)
 
         # --- soil moisture: rain in, proportional evaporation out ----------
         self.moisture = _clamp(self.moisture + weather.rainfall)
         self.moisture = _clamp(
-            self.moisture - self.moisture * EVAPORATION_RATE * jitter()
+            self.moisture - self.moisture * EVAPORATION_RATE * evap_j
         )
 
         # --- adequacy of the two big resources ----------------------------
@@ -185,7 +200,7 @@ class RubberTree:
         target_health = _clamp(target_health - 0.15 * weather.temperature_stress)
         self.health = _clamp(
             self.health + (target_health - self.health) * HEALTH_ADJUST_RATE
-            + rng.gauss(0.0, noise * 0.05)
+            + health_noise
         )
 
         # --- growth: logistic approach to MAX_GIRTH, gated by health/resources
@@ -197,7 +212,7 @@ class RubberTree:
             * min(water_ok, nutrient_ok)
             * growth_headroom
             * senescence
-            * jitter()
+            * growth_j
         )
         growth = max(0.0, growth)
         self.girth_cm = min(MAX_GIRTH_CM, self.girth_cm + growth)
@@ -206,7 +221,7 @@ class RubberTree:
         draw = (
             BASE_NUTRIENT_DRAW
             + GROWTH_NUTRIENT_DRAW * (growth / BASE_GIRTH_GROWTH_CM)
-        ) * jitter()
+        ) * draw_j
         if self.tapping and self.is_tappable:
             draw += TAP_NUTRIENT_DRAW
         self.nitrogen = _clamp(self.nitrogen - draw)
@@ -227,13 +242,13 @@ class RubberTree:
                 * girth_factor
                 * self.panel_health
                 * senescence
-                * max(0.0, jitter())
+                * latex_j
             )
             self.last_latex_lb = max(0.0, latex)
             self.cumulative_latex_lb += self.last_latex_lb
             # tapping costs the tree extra water and stresses the panel
             self.moisture = _clamp(self.moisture - 0.01)
-            self.panel_health = _clamp(self.panel_health - TAP_PANEL_STRESS * jitter())
+            self.panel_health = _clamp(self.panel_health - TAP_PANEL_STRESS * panel_j)
 
         # --- death: old age, or sustained collapse of health --------------
         if self.age_days >= MAX_AGE_DAYS or self.health <= 0.02:
@@ -280,7 +295,12 @@ class Farm:
 
     def __init__(self, spec: FarmSpec):
         self.spec = spec
-        self.rng = random.Random(spec.seed)
+        # Separate streams: one for tree genetics at init, one for daily weather.
+        # Per-tree day-to-day noise lives on each tree (seeded by position), so a
+        # scenario's stochastic realisation is fixed no matter what actions the
+        # operator takes — only the deterministic dynamics differ.
+        self._init_rng = random.Random(spec.seed)
+        self.weather_rng = random.Random(spec.seed ^ 0x9E3779B9)
         self.day = 0  # days elapsed since the start of the run
         self.ledger = Ledger()
         self.grid: list[list[RubberTree | None]] = [
@@ -296,7 +316,7 @@ class Farm:
 
     def _make_tree(self, ts: TreeSpec) -> RubberTree:
         noise = self.spec.noise
-        rng = self.rng
+        rng = self._init_rng
         growth_rate = (
             ts.growth_rate
             if ts.growth_rate is not None
@@ -317,6 +337,11 @@ class Farm:
         girth *= max(0.5, 1.0 + rng.gauss(0.0, noise * 0.5))
         girth = min(MAX_GIRTH_CM, max(SEEDLING_GIRTH_CM, girth))
 
+        # Stable per-tree seed from the scenario seed and the tree's position.
+        tree_seed = (
+            (self.spec.seed * 73856093) ^ (ts.row * 19349663) ^ (ts.col * 83492791)
+        ) & 0x7FFFFFFF
+
         return RubberTree(
             row=ts.row,
             col=ts.col,
@@ -330,6 +355,7 @@ class Farm:
             nitrogen=_clamp(rng.gauss(0.55, noise * 0.4)),
             phosphorus=_clamp(rng.gauss(0.55, noise * 0.4)),
             potassium=_clamp(rng.gauss(0.55, noise * 0.4)),
+            rng=random.Random(tree_seed),
         )
 
     # -------------------------------------------------------------- calendar
@@ -447,7 +473,7 @@ class Farm:
     # ------------------------------------------------------------------ step
     def _weather(self) -> Weather:
         """Generate the day's weather with a gentle seasonal rhythm + noise."""
-        rng = self.rng
+        rng = self.weather_rng
         # Seasonal wet/dry cycle over the year. In the wet season rain easily
         # keeps soil near its happy point; in the dry season irrigation pays off.
         season = 0.5 + 0.5 * math.sin(2 * math.pi * self.day_of_year / DAYS_PER_YEAR)
@@ -473,7 +499,7 @@ class Farm:
             rate = self.market_rate
             for tree in self.trees():
                 was_alive = tree.alive
-                produced = tree.step(weather, self.rng, self.spec.noise)
+                produced = tree.step(weather, self.spec.noise)
                 if produced:
                     latex_lb += produced
                     revenue += produced * rate
